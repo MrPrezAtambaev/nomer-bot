@@ -1,0 +1,15 @@
+[Unit]
+Description=nomer-bot (Telegram @akyl_nomer_bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nomerbot
+WorkingDirectory=/opt/nomer-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/nomer-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

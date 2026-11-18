@@ -1,0 +1,8 @@
+.env
+data/
+__pycache__/
+*.pyc
+.DS_Store
+state.copy.json
+# памятка агента: личные счета и доступы, в открытый репозиторий не идёт
+CLAUDE.md
