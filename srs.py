@@ -5,12 +5,10 @@
 import datetime as dt
 import html
 import http.client
-import http.cookiejar
 import re
 import threading
 import time
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 BASE = 'https://nomer.srs.kg'
@@ -46,63 +44,137 @@ def _throttle():
         _last[0] = time.monotonic()
 
 
-def _open(opener, url, data=None, ajax=False, timeout=20, tries=3):
-    err = None
-    for k in range(tries):
-        _throttle()
-        try:
-            h = {'User-Agent': UA}
-            if ajax:
-                h.update({'Faces-Request': 'partial/ajax', 'X-Requested-With': 'XMLHttpRequest',
-                          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'})
-            body = urllib.parse.urlencode(data).encode() if data is not None else None
-            r = opener.open(urllib.request.Request(url, data=body, headers=h), timeout=timeout)
-            return r.read().decode('utf-8', 'replace')
-        except Exception as e:      # сеть, 5xx — повторяем
-            err = e
-            if k + 1 < tries:
-                time.sleep(1 + 2 * k)
-    raise RuntimeError('nomer.srs.kg: %s' % err)
-
-
 HOST = 'nomer.srs.kg'
-_local = threading.local()
+# Свободные соединения и сессии списков, общие на все потоки. Соединения одни на всё — страницы номеров, списки,
+# слежение, маски: берём последнее вернувшееся, оно самое «тёплое». С машины в США запрос по открытому соединению
+# идёт 0,7 с, с новым TLS-рукопожатием — 1,7 с (замер 19.11.2026). Сессия списка — это только куки и ViewState.
+POOL_KEEP = 4
+_pool = {'http': [], 'plates': [], 'auctions': []}
+_pool_lock = threading.Lock()
+
+
+def _take(kind):
+    with _pool_lock:
+        return _pool[kind].pop() if _pool[kind] else None
+
+
+def _give(kind, x):
+    with _pool_lock:
+        if len(_pool[kind]) < POOL_KEEP:
+            _pool[kind].append(x)
+            return
+    if kind == 'http':
+        x.close()
+
+
+class _Http:
+    """Постоянное соединение с порталом: без нового TLS-рукопожатия на каждый запрос. Не для двух потоков сразу.
+
+    Сервер закрывает соединение через 60–70 с простоя (замер 19.11.2026) — тогда первый повтор сразу, на новом.
+    """
+
+    def __init__(self):
+        self.c, self.used = None, 0.0
+
+    def close(self):
+        try:
+            if self.c is not None:
+                self.c.close()
+        except Exception:
+            pass
+        self.c = None
+
+    def send(self, path, data=None, timeout=20, tries=3, jar=None, method=None):
+        """GET, а с data — AJAX-POST формы. jar — куки JSF-сессии списка; страницы номеров читаем без них. -> текст."""
+        h = {'User-Agent': UA, 'Accept-Encoding': 'identity'}
+        body = None
+        if data is not None:
+            h.update({'Faces-Request': 'partial/ajax', 'X-Requested-With': 'XMLHttpRequest',
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'})
+            body = urllib.parse.urlencode(data).encode()
+        err = None
+        for k in range(tries + 1):
+            _throttle()
+            reused = self.c is not None
+            try:
+                if self.c is None:
+                    self.c = http.client.HTTPSConnection(HOST, timeout=timeout)
+                elif self.c.sock is not None:
+                    self.c.sock.settimeout(timeout)
+                if jar:
+                    h['Cookie'] = '; '.join('%s=%s' % kv for kv in jar.items())
+                self.c.request(method or ('POST' if body is not None else 'GET'), path, body=body, headers=h)
+                r = self.c.getresponse()
+                raw = r.read()
+                if r.status != 200:
+                    raise RuntimeError('HTTP %d' % r.status)
+                if jar is not None:
+                    for v in r.msg.get_all('Set-Cookie') or []:
+                        name, _, val = v.split(';')[0].partition('=')
+                        jar[name.strip()] = val.strip()
+                self.used = time.monotonic()
+                return raw.decode('utf-8', 'replace')
+            except Exception as e:
+                err = e
+                self.close()
+                if reused and k == 0:
+                    continue                 # соединение протухло — это не сбой портала
+                if k + 1 >= tries:
+                    break
+                time.sleep(1 + 2 * k)
+        raise RuntimeError('nomer.srs.kg: %s' % err)
+
+
+def _request(path, data=None, timeout=20, tries=3, jar=None):
+    """Запрос к порталу по свободному открытому соединению."""
+    h = _take('http') or _Http()
+    try:
+        return h.send(path, data, timeout=timeout, tries=tries, jar=jar)
+    finally:
+        _give('http', h)
 
 
 def _get(path, timeout=20, tries=3):
-    """GET по постоянному соединению (своё на каждый поток): без нового TLS-рукопожатия на каждый запрос.
+    """GET страницы без сессии."""
+    return _request(path, timeout=timeout, tries=tries)
 
-    Издалека это в разы быстрее. Сервер закрывает простаивающее соединение — тогда первый повтор сразу, на новом.
-    """
-    err = None
-    for k in range(tries + 1):
-        _throttle()
-        c = getattr(_local, 'conn', None)
-        reused = c is not None
-        try:
-            if c is None:
-                c = _local.conn = http.client.HTTPSConnection(HOST, timeout=timeout)
-            elif c.sock is not None:
-                c.sock.settimeout(timeout)
-            c.request('GET', path, headers={'User-Agent': UA, 'Accept-Encoding': 'identity'})
-            r = c.getresponse()
-            body = r.read()
-            if r.status != 200:
-                raise RuntimeError('HTTP %d' % r.status)
-            return body.decode('utf-8', 'replace')
-        except Exception as e:
-            err = e
+
+# Пока человек пользуется ботом, держим одно соединение с порталом открытым: между его запросами часто больше
+# минуты (читает список), а новое соединение — лишняя секунда ожидания. Когда никто не пишет, портал не трогаем.
+WARM_FOR = 600          # сколько секунд после последнего сообщения человека держим соединение
+WARM_GAP = 45           # простой, после которого пора его освежить: портал закрывает через 60–70 с
+WARM_PATH = '/javax.faces.resource/jquery/jquery.js.xhtml?ln=primefaces'      # HEAD статики: сессию не заводит
+_warm = {'until': 0.0, 'busy': False}
+
+
+def touch():
+    """Человек что-то написал или нажал."""
+    _warm['until'] = time.monotonic() + WARM_FOR
+
+
+def warm_due():
+    """Пора освежить соединение? Дёшево, зовётся раз в секунду из цикла слежения. True — вызвать warm() в потоке."""
+    t = time.monotonic()
+    with _pool_lock:
+        h = _pool['http'][-1] if _pool['http'] else None
+        if t > _warm['until'] or _warm['busy'] or h is None or h.c is None or t - h.used < WARM_GAP:
+            return False
+        _warm['busy'] = True
+        return True
+
+
+def warm():
+    try:
+        h = _take('http')
+        if h is not None:
             try:
-                c.close()
-            except Exception:
-                pass
-            _local.conn = None
-            if reused and k == 0:
-                continue                 # соединение протухло — это не сбой портала
-            if k + 1 >= tries:
-                break
-            time.sleep(1 + 2 * k)
-    raise RuntimeError('nomer.srs.kg: %s' % err)
+                h.send(WARM_PATH, tries=1, timeout=10, method='HEAD')
+            finally:
+                _give('http', h)
+    except Exception:
+        pass                # не вышло — соединение закрыто, следующий запрос откроет новое
+    finally:
+        _warm['busy'] = False
 
 
 def ts(s):
@@ -198,52 +270,89 @@ AUC_MAX_PAGES = 240                         # потолок одной выка
 
 
 class _List:
-    """Список портала с фильтрами — plates.xhtml или auctions.xhtml: JSF-сессия и чтение по страницам."""
+    """Список портала с фильтрами — plates.xhtml или auctions.xhtml: JSF-сессия и чтение по страницам.
 
-    def __init__(self, kind, region, status, digits='', series=''):
-        self.url = '%s/%s.xhtml' % (BASE, kind)
-        self.kind, self.rows = kind, ROWS[kind]
-        self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
-        page = _open(self.op, self.url)
+    Сессию открываем один раз (тяжёлый GET на 40–120 КБ), дальше каждая новая маска — один запрос: set() шлёт всю
+    форму разом. Между вызовами сессия лежит в общем запасе (_list / _free). Не для двух потоков сразу.
+    """
+    ROW = {'plates': '<li class="ui-datalist-item', 'auctions': '<tr data-ri='}
+
+    def __init__(self, kind):
+        self.kind, self.rows, self.path = kind, ROWS[kind], '/%s.xhtml' % kind
+        self.jar = {}
+        page = _request(self.path, jar=self.jar)
         self.vs = re.search(r'name="javax.faces.ViewState"[^>]*value="([^"]+)"', page).group(1)
-        rf = REGION_FIELD[kind]
-        sel = re.search(r'<select id="%s_input".*?</select>' % rf, page, re.S).group(0)
-        uuids = re.findall(r'<option value="([0-9a-f-]{36})"', sel)      # «все регионы», затем 01…09
-        self.form = {'j_idt48': 'j_idt48', 'j_idt53_input': status, rf + '_input': uuids[int(region)],
+        self.rf = REGION_FIELD[kind]
+        sel = re.search(r'<select id="%s_input".*?</select>' % self.rf, page, re.S).group(0)
+        self.uuids = re.findall(r'<option value="([0-9a-f-]{36})"', sel)      # «все регионы», затем 01…09
+        self.form, self.total, self.head = {}, 0, ''
+        self.moved = False      # таблицу листали: она запомнила страницу
+
+    def set(self, region, status, digits='', series=''):
+        """Выставить фильтры — один запрос на всю форму. После него total и первая страница (page(0))."""
+        self.form = {'j_idt48': 'j_idt48', 'j_idt53_input': status, self.rf + '_input': self.uuids[int(region)],
                      'digits': digits, 'series': series}
-        if kind == 'plates':
+        if self.kind == 'plates':
             self.form.update({'j_idt61_input': '', 'j_idt68_input': ''})
-        r = ''
-        for src in ['j_idt53', rf] + (['digits'] if digits else []) + (['series'] if series else []):
-            r = self.ajax({'javax.faces.source': src, 'javax.faces.partial.execute': src,
-                           'javax.faces.partial.render': 'table j_idt48', 'javax.faces.behavior.event': 'valueChange',
-                           'javax.faces.partial.event': 'change'})
+        r = self.ajax({'javax.faces.source': 'digits', 'javax.faces.partial.execute': 'j_idt48',
+                       'javax.faces.partial.render': 'table j_idt48', 'javax.faces.behavior.event': 'valueChange',
+                       'javax.faces.partial.event': 'change'})
         m = re.search(r'rowCount:(\d+)', r)
         if not m:
             raise RuntimeError('nomer.srs.kg: список не открылся')
-        self.total, self.head = int(m.group(1)), r
+        self.total = int(m.group(1))
+        want = min(self.total, self.rows)
+        if self.moved or r.count(self.ROW[self.kind]) != want:
+            # Таблица помнит, до какой страницы её долистали в прошлый раз, и на новую маску отдаёт ту же страницу:
+            # у короткого списка она пустая, у длинного — не первая. Просим первую явно.
+            r = self._page(0)
+            if r.count(self.ROW[self.kind]) != want:
+                raise RuntimeError('nomer.srs.kg: список пришёл не с начала')
+        self.head = r
 
     def ajax(self, extra):
         d = dict(self.form)
         d.update(extra)
         d['javax.faces.ViewState'] = self.vs
         d['javax.faces.partial.ajax'] = 'true'
-        s = _open(self.op, self.url, d, ajax=True, timeout=40)
+        s = _request(self.path, d, timeout=40, jar=self.jar)
+        if '<redirect' in s:                        # /error/expired.xhtml — сессия протухла
+            raise RuntimeError('nomer.srs.kg: сессия списка истекла')
         m = re.search(r'ViewState[^>]*><!\[CDATA\[([^\]]+)\]\]>', s)
         if m:
             self.vs = m.group(1)
         return s
 
-    def page(self, n):
-        """Страница списка, счёт с нуля. Нулевая приходит вместе с фильтрами."""
-        if n == 0:
-            return self.head
+    def _page(self, n):
         d = {'javax.faces.source': 'table', 'javax.faces.partial.execute': 'table',
              'javax.faces.partial.render': 'table', 'table': 'table', 'table_pagination': 'true',
              'table_first': str(n * self.rows), 'table_rows': str(self.rows), 'table_page': str(n)}
         if self.kind == 'auctions':
             d['table_encodeFeature'] = 'true'       # без него таблица торгов не листается: отдаёт первую страницу
+        self.moved = n > 0
         return self.ajax(d)
+
+    def page(self, n):
+        """Страница списка, счёт с нуля. Нулевая приходит вместе с фильтрами."""
+        return self.head if n == 0 else self._page(n)
+
+
+def _list(kind, region, status, digits='', series='', fresh=False):
+    """Взять сессию списка и выставить фильтры. Из запаса, а протухла или сломалась — новая. Вернуть — _free()."""
+    lst = None if fresh else _take(kind)
+    if lst is not None:
+        try:
+            lst.set(region, status, digits, series)
+        except Exception:
+            lst = None
+    if lst is None:
+        lst = _List(kind)
+        lst.set(region, status, digits, series)
+    return lst
+
+
+def _free(lst):
+    _give(lst.kind, lst)
 
 
 def _plate_rows(x):
@@ -260,17 +369,19 @@ def fetch_free(region, digits='', series='', status='notSold'):
 
     status: notSold — свободные, booked — забронированные. Аукционных номеров в этом списке нет вообще.
     """
-    lst = _List('plates', region, status, digits, series)
-    if lst.total > 64 * 12:
-        raise RuntimeError('маска слишком широкая: %d номеров' % lst.total)
-    res = _plate_rows(lst.head)
+    lst = _list('plates', region, status, digits, series)
+    total = lst.total
+    res = _plate_rows(lst.head) if total <= 64 * 12 else {}
     page_no = 1
-    while len(res) < lst.total and page_no * 64 < lst.total:
+    while res and len(res) < total and page_no * 64 < total:
         got = _plate_rows(lst.page(page_no))
         if not got:
-            raise RuntimeError('nomer.srs.kg: пустая страница списка')
+            raise RuntimeError('nomer.srs.kg: пустая страница списка')      # сессию в запас не возвращаем
         res.update(got)
         page_no += 1
+    _free(lst)
+    if total > 64 * 12:
+        raise RuntimeError('маска слишком широкая: %d номеров' % total)
     if digits:
         res = {k: v for k, v in res.items() if k[:3] == digits}
     if series:
@@ -301,22 +412,27 @@ def fetch_auctions(region, digits='', series='', status=AUC_PLANNED, since=None)
     чтение на первых торгах раньше этого момента. В странице 10 строк, поэтому длинный список читаем в четыре сессии.
     """
     args = ('auctions', region, 'kg.infocom.auction.enums.AuctionStatus@%d' % status, digits, series)
-    first = _List(*args)
-    pages = -(-first.total // 10)
-    if not pages:
-        return []
+    first = _list(*args)
+    total = first.total
+    pages = -(-total // 10)
     if since:
         pages = min(pages, AUC_MAX_PAGES // 4)
-    elif pages > AUC_MAX_PAGES:
-        raise RuntimeError('маска слишком широкая: %d торгов' % first.total)
+    if not pages or pages > AUC_MAX_PAGES:
+        _free(first)
+        if pages:
+            raise RuntimeError('маска слишком широкая: %d торгов' % total)
+        return []
 
     def read(nums):
-        lst = first if nums[0] == 0 else _List(*args)
+        lst = first if nums[0] == 0 else _list(*args)
         out = []
-        for n in nums:
-            got = _auction_rows(lst.page(n))
+        for n in nums:                              # при ошибке сессию в запас не возвращаем
+            try:
+                got = _auction_rows(lst.page(n))
+            except RuntimeError:
+                got = []
             if not got:                             # сессия протухла посреди выкачки или список успел сократиться
-                lst = _List(*args)
+                lst = _list(*args, fresh=True)
                 if n * 10 >= lst.total:
                     break
                 got = _auction_rows(lst.page(n))
@@ -327,6 +443,7 @@ def fetch_auctions(region, digits='', series='', status=AUC_PLANNED, since=None)
             out += got
             if since and got[-1]['at'] < since:
                 break
+        _free(lst)
         return out
 
     if since:

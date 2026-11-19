@@ -7,15 +7,15 @@
 """
 import datetime as dt
 import html
+import http.client
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
 import uuid
 import zoneinfo
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +32,7 @@ TZ = zoneinfo.ZoneInfo('Asia/Bishkek')
 DATA = os.environ.get('DATA_DIR') or os.path.join(ROOT, 'data')
 STATE = os.path.join(DATA, 'state.json')
 DEFAULT_REGION = '01'      # пока чат не выбрал свой в /region; команды-ссылки без префикса — всегда этот регион
-MAX_WATCH, MAX_MASKS = 30, 10
+MAX_WATCH, MAX_MASKS = 30, 20      # на один чат
 ADMIN = int(os.environ.get('ADMIN_CHAT') or 376894754)      # чат владельца: только ему отвечаем на /stats
 KEEP = 20           # сколько последних запросов каждого чата помним для /stats
 IDLE = 600          # обычная проверка номера, сек
@@ -58,7 +58,6 @@ def load_env():
 
 load_env()
 TOKEN = os.environ.get('BOT_TOKEN', '')
-API = 'https://api.telegram.org/bot%s/' % TOKEN
 
 
 # ---------- Telegram ----------
@@ -75,6 +74,45 @@ def _multipart(fields, files):
     return b''.join(out), 'multipart/form-data; boundary=' + b
 
 
+TG_HOST = 'api.telegram.org'
+# Свободные соединения с Telegram, общие на все потоки: запрос по открытому идёт 0,1 с, с новым TLS-рукопожатием —
+# 0,4 с (замер с машины 19.11.2026). На каждое нажатие кнопки уходит два-три вызова.
+_tg_idle, _tg_lock = [], threading.Lock()
+
+
+def _tg_post(method, body, ctype, timeout):
+    """POST в Bot API по открытому соединению. -> (код ответа, тело)."""
+    for attempt in (0, 1):
+        with _tg_lock:
+            # Длинный опрос берёт самое давнее соединение и тем его освежает, отправка — самое свежее: так под ответ
+            # человеку всегда лежит открытое, даже если до этого бот молчал часами.
+            c = _tg_idle.pop(0 if method == 'getUpdates' else -1) if _tg_idle else None
+        reused = c is not None
+        try:
+            if c is None:
+                c = http.client.HTTPSConnection(TG_HOST, timeout=timeout)
+            elif c.sock is not None:
+                c.sock.settimeout(timeout)
+            c.request('POST', '/bot%s/%s' % (TOKEN, method), body=body, headers={'Content-Type': ctype})
+            r = c.getresponse()
+            data = r.read()
+        except Exception as e:
+            c.close()
+            # Telegram закрыл простаивавшее соединение: запрос до него не дошёл, повторяем на новом. Таймаут — другое
+            # дело: запрос мог быть выполнен, его повторяет только tg() со своей паузой.
+            stale = isinstance(e, (OSError, http.client.BadStatusLine, http.client.CannotSendRequest))
+            if reused and attempt == 0 and stale and not isinstance(e, (TimeoutError, socket.timeout)):
+                continue
+            raise
+        with _tg_lock:
+            keep = len(_tg_idle) < 4
+            if keep:
+                _tg_idle.append(c)
+        if not keep:
+            c.close()
+        return r.status, data
+
+
 def tg(method, payload=None, files=None, timeout=60):
     payload = payload or {}
     for attempt in range(3):
@@ -85,13 +123,13 @@ def tg(method, payload=None, files=None, timeout=60):
                 body, ctype = _multipart(fields, files)
             else:
                 body, ctype = json.dumps(payload, ensure_ascii=False).encode('utf-8'), 'application/json'
-            req = urllib.request.Request(API + method, data=body, headers={'Content-Type': ctype})
-            return json.load(urllib.request.urlopen(req, timeout=timeout))
-        except urllib.error.HTTPError as e:
+            status, data = _tg_post(method, body, ctype, timeout)
+            if status == 200:
+                return json.loads(data)
             try:
-                r = json.load(e)
+                r = json.loads(data)
             except Exception:
-                r = {'ok': False, 'description': 'HTTP %s' % e.code}
+                r = {'ok': False, 'description': 'HTTP %s' % status}
             wait = (r.get('parameters') or {}).get('retry_after')
             if wait and attempt < 2:
                 time.sleep(min(wait, 30) + 0.5)
@@ -173,6 +211,7 @@ def who(u):
 
 def note(cid, user, text=None, button=None):
     """Кто пишет боту, сколько раз и что спрашивал: счёт и последние запросы — в состоянии, вся история — в логе."""
+    srs.touch()
     with S.lock:
         S.d.setdefault('since', now().strftime('%d.%m.%Y %H:%M'))
         ch = S.chat(cid)
@@ -526,6 +565,10 @@ def refresh_prices(_key=None):
 
 def watcher():
     pool = ThreadPoolExecutor(4)
+    # Маски — в своей очереди: в 00:00 они срабатывают все разом, а номера в эту минуту проверяются раз в 2 с
+    # и ждать за масками не должны. Проверка маски — один запрос, 0,4 с с машины; если портал в полночь тормозит,
+    # два потока не дадут маскам занять больше половины из четырёх запросов в секунду.
+    mask_pool = ThreadPoolExecutor(2)
 
     def run(fn, key):
         try:
@@ -555,9 +598,11 @@ def watcher():
                 for key, e in list(S.d['masks'].items()):
                     if not e.get('busy') and ts >= e.get('next', 0):
                         e['busy'] = True
-                        pool.submit(run, check_mask, key)
+                        mask_pool.submit(run, check_mask, key)
             for cid, text, kb in notes:
                 say(cid, text, kb)
+            if srs.warm_due():
+                pool.submit(srs.warm)
             if ts - (S.d.get('prices') or {}).get('at', 0) > PRICES_EVERY and not prices_busy[0]:
                 prices_busy[0] = True
                 pool.submit(lambda: (refresh_prices(), prices_busy.__setitem__(0, False)))

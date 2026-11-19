@@ -3,7 +3,6 @@ import collections
 import datetime as dt
 import html
 import re
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import card
@@ -20,7 +19,7 @@ PER_ROW = 30    # номеров в строке: в сообщении Telegram
 
 def fetch_auction_digits():
     """Аукционные цифры из прайс-листа портала (первая таблица). -> список или None."""
-    page = srs._open(urllib.request.build_opener(), srs.BASE + '/prices.xhtml')
+    page = srs._get('/prices.xhtml')
     tabs = re.findall(r'<table.*?</table>', page, re.S)
     if not tabs:
         return None
@@ -94,12 +93,12 @@ def collect_digits(region, digits, now):
     торги. Страницы открываем только тем, чьи торги сорвались за последние дни: это номера между торгами
     и те, что вот-вот выйдут без аукциона. Аукционных номеров, по которым торгов ещё не было, в списках нет.
     """
-    with ThreadPoolExecutor(3) as ex:
-        f_free = ex.submit(srs.fetch_free, region, digits)
-        f_book = ex.submit(srs.fetch_free, region, digits, '', 'booked')
+    with ThreadPoolExecutor(2) as ex:
+        # свободные и забронированные — в одном потоке: это одна сессия портала, второй список стоит один запрос
+        f_sale = ex.submit(lambda: (srs.fetch_free(region, digits), srs.fetch_free(region, digits, '', 'booked')))
         f_fail = ex.submit(srs.fetch_auctions, region, digits, '', srs.AUC_FAILED, now - dt.timedelta(days=RECENT))
         plan = {a['sym']: a for a in srs.fetch_auctions(region, digits)}
-        free, booked, failed = f_free.result(), f_book.result(), f_fail.result()
+        (free, booked), failed = f_sale.result(), f_fail.result()
     out = _blank(free)
     todo = sorted(set(booked) | {a['sym'] for a in failed} - set(plan) - set(free))
     pages = _pages(region, todo)

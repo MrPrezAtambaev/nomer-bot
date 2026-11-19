@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -18,6 +19,8 @@ import bot       # noqa: E402
 import forecast  # noqa: E402
 import series    # noqa: E402
 import srs       # noqa: E402
+
+REAL_FREE, REAL_AUCTIONS = srs.fetch_free, srs.fetch_auctions      # дальше их подменяют
 
 sent = []
 
@@ -275,5 +278,172 @@ os.remove(os.path.join(TMP, 'state.json'))
 os.environ['STATE_SEED'] = base64.b64encode(json.dumps({'watch': {'01-111HAH': {'chats': [5]}}, 'offset': 7}).encode()).decode()
 st = bot.Store()
 assert list(st.d['watch']) == ['01-111HAH'] and st.d['offset'] == 7
+
+# ---------- клиент портала: списки одной сессией (поддельный портал, сеть не нужна) ----------
+
+class FakePortal:
+    """Ведёт себя как списки nomer.srs.kg: сессия по куке, все фильтры одной формой, таблица помнит свою страницу."""
+    UUIDS = ['%08d-0000-0000-0000-000000000000' % i for i in range(10)]
+
+    def __init__(self):
+        self.data, self.sess, self.log = {}, {}, []
+
+    def render(self, kind, rows, total):
+        if kind == 'plates':
+            x = ''.join('<li class="ui-datalist-item"><b class="lp-numbers">%s</b><b class="lp-letters">%s</b>'
+                        '<b class="lp-pub-price">12 000</b></li>' % (r[:3], r[3:]) for r in rows)
+        else:
+            x = ''.join('<tr data-ri="%d"><td></td><td></td><td>01 %s %s</td><td>50 000</td><td></td><td></td><td></td>'
+                        '<td></td><td>%s</td></tr>' % (i, sym[:3], sym[3:], at) for i, (sym, at) in enumerate(rows))
+        return x + ('rows:%d,rowCount:%d,page:0' % (srs.ROWS[kind], total) if total is not None else '')
+
+    def handle(self, cookie, path, data):
+        kind = path.strip('/').split('.')[0]
+        if data is None:
+            sid = 's%d' % (len(self.log) + 1)
+            self.sess[sid] = {'key': None, 'first': 0}
+            self.log.append('GET')
+            return sid, ('<input name="javax.faces.ViewState" value="vs"/><select id="%s_input">%s</select>'
+                         % (srs.REGION_FIELD[kind], ''.join('<option value="%s">' % u for u in self.UUIDS)))
+        st = self.sess.get(cookie)
+        if st is None:
+            self.log.append('expired')
+            return cookie, '<partial-response><redirect url="/error/expired.xhtml"></redirect></partial-response>'
+        per = srs.ROWS[kind]
+        if data.get('table_pagination'):
+            st['first'] = int(data['table_first'])
+            self.log.append('page')
+            return cookie, self.render(kind, self.data.get(st['key'], [])[st['first']:st['first'] + per], None)
+        region = '%02d' % self.UUIDS.index(data[srs.REGION_FIELD[kind] + '_input'])
+        st['key'] = (kind, region, data['j_idt53_input'].rsplit('@', 1)[-1], data['digits'], data['series'])
+        self.log.append('set')
+        rows = self.data.get(st['key'], [])
+        return cookie, self.render(kind, rows[st['first']:st['first'] + per], len(rows))      # страница — прежняя!
+
+
+class FakeHttp:
+    def __init__(self):
+        self.c, self.used = True, 0.0
+
+    def close(self):
+        self.c = None
+
+    def send(self, path, data=None, timeout=20, tries=3, jar=None, method=None):
+        self.used = time.monotonic()
+        if method == 'HEAD':
+            PORTAL.log.append('HEAD')
+            return ''
+        sid, body = PORTAL.handle((jar or {}).get('JSESSIONID'), path, data)
+        if jar is not None:
+            jar['JSESSIONID'] = sid
+        return body
+
+
+PORTAL = FakePortal()
+srs._Http, srs._throttle = FakeHttp, lambda: None
+for k in srs._pool:
+    srs._pool[k].clear()
+plates = lambda digits, n: ['%s%s' % (digits, 'A' + chr(65 + i // 26) + chr(65 + i % 26)) for i in range(n)]
+PORTAL.data = {('plates', '01', 'notSold', '777', ''): plates('777', 5),
+               ('plates', '02', 'notSold', '777', ''): plates('777', 70),
+               ('plates', '01', 'notSold', '001', ''): plates('001', 200),
+               ('plates', '01', 'notSold', '', 'BBB'): ['114BBB', '124BBB', '373BBB'],
+               ('plates', '01', 'booked', '777', ''): ['777MUK'],
+               ('plates', '01', 'notSold', '', ''): plates('100', 800)}
+
+
+def portal(fn, *a):
+    PORTAL.log.clear()
+    return fn(*a), ' '.join(PORTAL.log)
+
+
+r, log = portal(REAL_FREE, '01', '777')
+assert sorted(r) == plates('777', 5) and log == 'GET set', (r, log)                # первая маска: открыть и выставить
+r, log = portal(REAL_FREE, '01', '', 'BBB')
+assert sorted(r) == ['114BBB', '124BBB', '373BBB'] and log == 'set', (r, log)      # следующая — один запрос
+r, log = portal(REAL_FREE, '01', '777', '', 'booked')
+assert list(r) == ['777MUK'] and log == 'set', (r, log)
+r, log = portal(REAL_FREE, '02', '777')
+assert len(r) == 70 and log == 'set page', (len(r), log)                           # две страницы
+# ловушка портала: таблица осталась на второй странице. Короткий список пришёл бы пустым — а пустой список у маски
+# значит «все номера ушли», и на следующей проверке бот разослал бы их все как новые
+r, log = portal(REAL_FREE, '01', '', 'BBB')
+assert sorted(r) == ['114BBB', '124BBB', '373BBB'] and log == 'set page', (r, log)
+r, log = portal(REAL_FREE, '02', '777')
+assert len(r) == 70 and log == 'set page', (len(r), log)
+r, log = portal(REAL_FREE, '01', '001')                                            # длинный пришёл бы не с начала
+assert sorted(r) == plates('001', 200) and log == 'set page page page page', (len(r), log)
+r, log = portal(REAL_FREE, '01', '123', 'ZZZ')
+assert r == {} and log == 'set page', (r, log)                                     # пустая маска — честно пусто
+PORTAL.sess.clear()                                                                # сессия на портале истекла
+r, log = portal(REAL_FREE, '01', '777')
+assert sorted(r) == plates('777', 5) and log == 'expired GET set', (r, log)
+try:
+    REAL_FREE('01')
+    raise AssertionError('слишком широкая маска должна давать ошибку')
+except RuntimeError as e:
+    assert 'слишком широкая' in str(e), e
+r, log = portal(REAL_FREE, '01', '777')
+assert sorted(r) == plates('777', 5) and log == 'set', (r, log)                    # сессия после этого жива
+assert len(srs._pool['plates']) == 1, srs._pool
+
+day = lambda n: (dt.datetime(2026, 11, 30) - dt.timedelta(days=n)).strftime('%d.%m.%Y 10:00')
+sym = lambda c, i: '070%s%s%s' % (c, chr(65 + i // 26), chr(65 + i % 26))
+PORTAL.data.update({('auctions', '01', '1', '070', ''): [(sym('P', i), day(-i)) for i in range(25)],
+                    ('auctions', '01', '9', '070', ''): [(sym('F', i), day(i)) for i in range(40)],
+                    ('auctions', '01', '1', '123', ''): []})
+r, log = portal(REAL_AUCTIONS, '01', '070')
+assert [a['sym'] for a in r] == [sym('P', i) for i in range(25)] and log == 'GET set page page', (r, log)
+r, log = portal(REAL_AUCTIONS, '01', '070', '', srs.AUC_FAILED, dt.datetime(2026, 11, 18))
+assert [a['sym'] for a in r] == [sym('F', i) for i in range(13)] and log == 'set page page', (r, log)   # с начала!
+r, log = portal(REAL_AUCTIONS, '01', '123')
+assert r == [] and log == 'set page', (r, log)
+assert len(srs._pool['auctions']) == 1, srs._pool
+assert len(srs._pool['http']) == 1, srs._pool        # одно соединение на всё
+
+# соединение с порталом держим открытым, только пока человек пользуется ботом
+srs._warm['until'] = 0.0
+conn = srs._pool['http'][-1]
+conn.used -= 100
+assert not srs.warm_due()                             # никто не писал — портал не трогаем
+bot.note(CID, {'first_name': 'Тест'}, '777')
+assert srs.warm_due() and not srs.warm_due()          # написал, соединение простаивает — пора; второй раз не зовём
+PORTAL.log.clear()
+srs.warm()
+assert PORTAL.log == ['HEAD'] and not srs._warm['busy'] and not srs.warm_due(), (PORTAL.log, srs._warm)
+conn.used -= 100
+srs._warm['until'] = 0.0
+assert not srs.warm_due()                             # десять минут тишины — снова не трогаем
+
+# Telegram: длинный опрос берёт самое давнее соединение, отправка — самое свежее; закрытое — повтор на новом
+class FakeConn:
+    def __init__(self, name, dead=False):
+        self.name, self.sock, self.dead, self.calls = name, None, dead, []
+
+    def request(self, m, path, body=None, headers=None):
+        if self.dead:
+            raise ConnectionResetError('закрыто')
+        self.calls.append(path.rsplit('/', 1)[-1])
+
+    def getresponse(self):
+        return type('R', (), {'status': 200, 'read': staticmethod(lambda: b'{"ok": true}')})
+
+    def close(self):
+        self.calls.append('close')
+
+
+A, B = FakeConn('A'), FakeConn('B')
+bot._tg_idle[:] = [A, B]
+assert bot._tg_post('getUpdates', b'{}', 'application/json', 5) == (200, b'{"ok": true}')
+assert A.calls == ['getUpdates'] and [c.name for c in bot._tg_idle] == ['B', 'A'], (A.calls, bot._tg_idle)
+bot._tg_post('sendMessage', b'{}', 'application/json', 5)
+assert A.calls == ['getUpdates', 'sendMessage'] and B.calls == [], (A.calls, B.calls)
+real_conn = bot.http.client.HTTPSConnection
+bot.http.client.HTTPSConnection = lambda host, timeout=None: FakeConn('new')
+bot._tg_idle[:] = [FakeConn('old', dead=True)]
+assert bot._tg_post('sendMessage', b'{}', 'application/json', 5)[0] == 200
+assert [c.name for c in bot._tg_idle] == ['new'] and bot._tg_idle[0].calls == ['sendMessage'], bot._tg_idle
+bot.http.client.HTTPSConnection = real_conn
+bot._tg_idle[:] = []
 
 print('OK: все сценарии прошли')
