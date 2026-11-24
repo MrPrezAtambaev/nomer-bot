@@ -26,17 +26,10 @@ Railway: сервис из `Dockerfile` (`railway.json`), том на `/data`, �
 
 ## Где работает
 
-С 17.11.2026 — Google Cloud, проект `meta-strata-380705` (название `nomer-bot`), машина `nomer-bot` (e2-micro, `us-central1-a`,
-Debian 12). Код в `/opt/nomer-bot`, сервис systemd `nomer-bot` (пользователь `nomerbot`, `Restart=always`, включён в автозапуск).
+На облачной машине как сервис systemd (`deploy/nomer-bot.service`): автозапуск, перезапуск при падении.
+Обновить код и перезапустить — `deploy/gce.sh`.
 
-```bash
-deploy/gce.sh                                   # обновить код на машине и перезапустить
-gcloud compute ssh nomer-bot --zone us-central1-a --project meta-strata-380705 \
-  --command 'sudo journalctl -u nomer-bot -n 50 --no-pager -o cat'      # лог
-```
-
-На Маке бот больше не запущен: один токен — один процесс.
-Один экземпляр на токен: два процесса с long polling мешают друг другу.
+Один токен — один процесс: два процесса с long polling мешают друг другу.
 
 ## Как устроено
 
