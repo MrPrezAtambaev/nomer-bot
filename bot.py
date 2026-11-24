@@ -24,6 +24,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import base64    # noqa: E402
 import card      # noqa: E402
+import nice      # noqa: E402
 import render    # noqa: E402
 import series    # noqa: E402
 import srs       # noqa: E402
@@ -630,6 +631,7 @@ HELP = (
     'свободные, забронированные и те, что на торгах; длинный список листается кнопками. '
     'Номера в списках нажимаются: /777EEF — карточка, /EEF — серия, /777 — цифры. Такие ссылки без региона — '
     'всегда 01 (Бишкек), другой регион пишется в самой ссылке: /02_777EEF, /02_777.\n\n'
+    '/blat — красивые номера, которые можно купить прямо сейчас: лучшие, недорогие, зеркальные, слова, имена, авто\n'
     '/sub 777 — сообщать о любых свободных номерах без аукциона с цифрами 777. '
     'Ещё так: <code>/sub HAH</code>, <code>/sub 02 001</code>, <code>/sub 777 HAH</code>\n'
     '/list — за чем слежу, там же отписка\n'
@@ -809,6 +811,49 @@ def send_list(cid, region, key, fresh=False, page=0, mid=None):
     show(cid, mid, pages[page], list_kb(region, key, page, len(pages)))
 
 
+NICE = {}           # регион -> (когда собран, время для подписи, все свободные номера)
+NICE_TTL = 1800     # на подборке красивых номеров это не страшно: днём их покупают редко, рядом кнопка «Обновить»
+NICE_LOCK = threading.Lock()    # двое попросили разом — портал читаем один раз
+NICE_WORDS = {'блатные', 'блатные номера', 'красивые', 'красивые номера'}
+
+
+def nice_kb(region, cat, n, total):
+    to = lambda c, page, text: {'text': text, 'callback_data': 'b|%s|%s|%d' % (region, c, page)}
+    rows = []
+    if total > 1:
+        rows.append(([to(cat, n - 1, '◂ стр. %d' % n)] if n else [])
+                    + ([to(cat, n + 1, 'стр. %d из %d ▸' % (n + 2, total))] if n + 1 < total else []))
+    marks = [to(c, 0, ('✅ ' if c == cat else '') + nice.CATS[c][0]) for c in nice.CATS]
+    rows += [marks[i:i + 2] for i in range(0, len(marks), 2)]
+    return rows + [[{'text': '🔄 Обновить', 'callback_data': 'f|%s|%s' % (region, cat)}]]
+
+
+def send_nice(cid, region, cat='top', page=0, mid=None, fresh=False):
+    """Красивые номера из свободной продажи: подборка cat. mid — сообщение, в котором листаем."""
+    ttl = 60 if fresh else NICE_TTL
+    old = lambda: region not in NICE or time.time() - NICE[region][0] > ttl
+    if old():
+        wait = '🔎 Красивые номера: читаю все свободные, это до 40 секунд…'
+        if mid:
+            show(cid, mid, wait)
+        else:
+            mid = (say(cid, wait).get('result') or {}).get('message_id')
+        try:
+            with NICE_LOCK:
+                if old():
+                    t0 = time.time()
+                    free = srs.fetch_all_free(region)
+                    NICE[region] = (time.time(), now(), free)
+                    log('NICE', region, '%d номеров, %.1f с' % (len(free), time.time() - t0))
+        except Exception as e:
+            log('nice', region, e)
+            return show(cid, mid, 'Портал nomer.srs.kg не ответил, попробуй ещё раз через минуту.')
+    _, at, free = NICE[region]
+    pages = nice.pages(region, cat, free, at)
+    page = max(0, min(page, len(pages) - 1))
+    show(cid, mid, pages[page], nice_kb(region, cat, page, len(pages)))
+
+
 def show_plates(cid, plates):
     for region, sym in plates:
         p, c = send_card(cid, region, sym)
@@ -830,7 +875,7 @@ def on_message(m):
     cmd = cmd.split('@')[0].lower()
     if cmd == '/stats' and cid == ADMIN:
         return cmd_stats(cid)
-    if cmd.startswith('/') and cmd not in ('/start', '/help', '/list', '/sub', '/mode', '/region'):
+    if cmd.startswith('/') and cmd not in ('/start', '/help', '/list', '/sub', '/mode', '/region', '/blat'):
         # быстрый доступ: /777EEF и /02_777EEF — карточка, /EEF и /02_EEF — вся серия, /777 и /02_777 — все с цифрами
         q = cmd[1:].upper()
         mm = re.fullmatch(r'(?:(0[1-9])_)?(\d{3}[A-Z]{3})', q)
@@ -852,6 +897,11 @@ def on_message(m):
         return cmd_list(cid)
     if cmd == '/sub':
         return cmd_sub(cid, arg)
+    if cmd == '/blat':
+        mm = re.fullmatch(r'0?([1-9])', arg.strip())
+        return send_nice(cid, '0' + mm.group(1) if mm else region)
+    if text.lower() in NICE_WORDS:
+        return send_nice(cid, region)
     if cmd == '/mode':
         ch = S.chat(cid)
         ch['mode'] = 'photo' if ch.get('mode') != 'photo' else 'widget'
@@ -891,6 +941,10 @@ def on_callback(q):
         mm = re.fullmatch(r'(0[1-9])\|(%s)\|(\d{1,3})' % LIST_KEY, rest)
         done()
         return send_list(cid, mm.group(1), mm.group(2), page=int(mm.group(3)), mid=mid) if mm else None
+    if act in ('b', 'f'):       # красивые номера: регион|подборка|страница; f — перечитать портал
+        mm = re.fullmatch(r'(0[1-9])\|(%s)(?:\|(\d{1,3}))?' % '|'.join(nice.CATS), rest)
+        done('Обновляю…' if act == 'f' else '')
+        return send_nice(cid, mm.group(1), mm.group(2), int(mm.group(3) or 0), mid, act == 'f') if mm else None
     region, _, sym = rest.partition('|')
     if act in ('m', 's') and re.fullmatch(r'0[1-9]', region) and re.fullmatch(LIST_KEY, sym):
         if act == 'm':
@@ -946,6 +1000,7 @@ def main():
     except Exception as e:
         log('ПОРТАЛ НЕ ОТВЕЧАЕТ отсюда:', e)
     tg('setMyCommands', {'commands': [
+        {'command': 'blat', 'description': 'Красивые номера'},
         {'command': 'list', 'description': 'За чем слежу'},
         {'command': 'sub', 'description': 'Маска: /sub 777 или /sub HAH'},
         {'command': 'region', 'description': 'Регион по умолчанию'},

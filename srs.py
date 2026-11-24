@@ -267,6 +267,7 @@ ROWS = {'plates': 64, 'auctions': 10}       # размер страницы за
 REGION_FIELD = {'plates': 'j_idt75', 'auctions': 'j_idt58'}
 AUC_PLANNED, AUC_FAILED = 1, 9              # статусы в списке торгов: назначены, не состоялись
 AUC_MAX_PAGES = 240                         # потолок одной выкачки списка торгов — минута работы при 4 запросах/с
+FREE_MAX_PAGES = 160                        # потолок выкачки всех свободных региона (самый большой, 04, — 92 страницы)
 
 
 class _List:
@@ -358,6 +359,8 @@ def _free(lst):
 def _plate_rows(x):
     out = {}
     for li in re.findall(r'<li class="ui-datalist-item.*?</li>', x, re.S):
+        if 'symbols=null' in li:        # именной номер без цифр (04 OMED) — пропускаем только такие: если портал сменит
+            continue                    # вёрстку, нужна ошибка, а не пустой список — маски приняли бы его за «все ушли»
         n = re.search(r'lp-numbers">([^<]*)', li).group(1).strip()
         l = re.search(r'lp-letters">([^<]*)', li).group(1).strip()
         out[n + l] = _num(html.unescape(re.search(r'lp-pub-price">([^<]*)', li).group(1))) or 0
@@ -386,6 +389,54 @@ def fetch_free(region, digits='', series='', status='notSold'):
         res = {k: v for k, v in res.items() if k[:3] == digits}
     if series:
         res = {k: v for k, v in res.items() if k[3:] == series}
+    return res
+
+
+def fetch_all_free(region):
+    """Все номера свободной продажи региона. -> {sym: цена}.
+
+    В регионе 2,5–6 тысяч номеров по 64 на странице. Читаем в четыре сессии: 4342 номера Бишкека — 19–31 с (24.11.2026),
+    быстрее не даёт общий ограничитель. Пока читаем, номера покупают и страницы сдвигаются, поэтому пара номеров
+    может потеряться — для подборки это неважно, для слежения этот список не годится.
+    """
+    args = ('plates', region, 'notSold')
+    first = _list(*args)
+    total = first.total
+    pages = -(-total // 64)
+    if not pages or pages > FREE_MAX_PAGES:
+        _free(first)
+        if pages:
+            raise RuntimeError('слишком длинный список: %d номеров' % total)
+        return {}
+
+    def read(nums):
+        lst = first if nums[0] == 0 else _list(*args)
+        out = {}
+        for n in nums:                              # при ошибке сессию в запас не возвращаем
+            try:
+                got = _plate_rows(lst.page(n))
+            except RuntimeError:
+                got = {}
+            if not got:                             # сессия протухла посреди выкачки или список успел сократиться
+                lst = _list(*args, fresh=True)
+                if n * 64 >= lst.total:
+                    break
+                got = _plate_rows(lst.page(n))
+                if not got:
+                    raise RuntimeError('nomer.srs.kg: пустая страница списка')
+            if out and not set(got) - set(out):     # та же страница второй раз — не долбим портал по кругу
+                raise RuntimeError('nomer.srs.kg: список не листается')
+            out.update(got)
+        _free(lst)
+        return out
+
+    size = -(-pages // max(1, min(4, pages // 4)))
+    res = {}
+    with ThreadPoolExecutor(4) as ex:
+        for part in ex.map(read, [range(i, min(i + size, pages)) for i in range(0, pages, size)]):
+            res.update(part)
+    if len(res) < total * 0.95:
+        raise RuntimeError('nomer.srs.kg: пришло %d номеров из %d' % (len(res), total))
     return res
 
 

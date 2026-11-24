@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,10 +18,11 @@ os.environ.setdefault('BOT_TOKEN', 'test')
 
 import bot       # noqa: E402
 import forecast  # noqa: E402
+import nice      # noqa: E402
 import series    # noqa: E402
 import srs       # noqa: E402
 
-REAL_FREE, REAL_AUCTIONS = srs.fetch_free, srs.fetch_auctions      # дальше их подменяют
+REAL_FREE, REAL_AUCTIONS, REAL_ALL = srs.fetch_free, srs.fetch_auctions, srs.fetch_all_free      # дальше их подменяют
 
 sent = []
 
@@ -258,6 +260,67 @@ assert bot.parse_mask('02 *** HAH') == ('02', '', 'HAH') and bot.parse_mask('777
 msg('/list')
 assert '/777LVS' in texts()[0]
 
+# красивые номера: оценка, подборки, кнопки
+assert nice.rate('777NAN')[0] > nice.rate('777EEF')[0] > nice.rate('358EEF')[0]
+assert nice.rate('001AAA')[0] > nice.rate('123AAA')[0] > nice.rate('358AAA')[0]
+assert nice.rate('404NAN') == (44 + 70 + 18, 'нан, хлеб · зеркальный'), nice.rate('404NAN')
+assert nice.rate('777HAH')[1] == 'НАН, хлеб · тройка' and nice.rate('358QXZ') == (0, '')
+assert nice.rate('345BOS')[1] == 'босс · по порядку' and nice.rate('570WWW')[1] == 'три одинаковые · Lexus LX 570'
+assert all(len(s) == 3 and s.isalpha() and s.isupper() and s.isascii() and g for s, (_, g) in nice.DICT.items())
+assert not set(nice.DICT) & nice.BLOCKED and len(nice.DICT) == sum(
+    len([x for x in t.replace('\n', '|').split('|') if x.strip()]) for t in nice.WORDS.values())      # без повторов
+for n in range(1, 1000):
+    assert 0 <= nice.digits('%03d' % n)[0] <= 100, n
+pool_ = {'777NAN': 49600, '777KOT': 49600, '777QXZ': 33600, '404NAN': 12000, '505NAN': 12000, '606NAN': 12000,
+         '786AZA': 6000, '316TTT': 15000, '358BMW': 1500, '358QXZ': 1500}
+syms = lambda cat: [r[0] for r in nice.pick(cat, pool_)]
+assert syms('top') == ['777NAN', '404NAN', '786AZA'], syms('top')     # одна серия — не больше двух, 777KOT запрещён
+assert syms('cheap') == ['786AZA'] and syms('num') == ['777NAN', '777QXZ'], (syms('cheap'), syms('num'))
+assert syms('mir') == ['777NAN', '404NAN', '505NAN', '606NAN'] and syms('tri') == ['316TTT'] and syms('auto') == ['358BMW']
+assert syms('name') == ['786AZA'] and syms('cool') == [] and syms('kg')[0] == '777NAN'
+many = {a + b + a + c * 3: 31500 for a, b, c in zip('12345678' * 3, '345678912' * 3, 'ABCDEFGHIJKLMNOPQRSTUVWX')}
+assert len(many) == 24 and len(nice.pick('tri', many)) == 24 and len(nice.pick('top', many)) == nice.TRIPLES
+free_ = [dict(pool_)]
+srs.fetch_all_free = lambda region: (calls.append(('all', region)) or dict(free_[0]))
+calls.clear()
+for text, want in [('/blat', '01'), ('блатные', None), ('Красивые номера', None), ('/blat 2', '02')]:
+    calls.clear()
+    msg(text)
+    t = texts()[-1]
+    assert calls == ([('all', want)] if want else []) and 'Лучшие' in t, (text, calls, t)       # второй раз — из запаса
+assert '/02_777NAN — 49 600 · нан, хлеб · тройка' in t and '02 г. Ош' in t, t
+cb('b|01|mir|0')
+assert sent[-1][0] == 'editMessageText' and '/404NAN' in texts()[-1]
+cb('b|01|cool|7')
+assert 'нет' in texts()[-1]
+calls.clear()
+cb('f|01|top')                                       # обновляли меньше минуты назад — портал не трогаем
+assert not calls and '/777NAN' in texts()[-1]
+bot.NICE['01'] = (time.time() - 100,) + bot.NICE['01'][1:]
+free_[0] = {'100%s%s%s' % (a, b, a): 25600 for a in 'ABCDEFGHIJ' for b in 'KLMNOP'}
+cb('b|01|num|0')
+assert not calls and '/777QXZ' in texts()[-1]
+cb('f|01|num')
+t = texts()
+assert calls == [('all', '01')] and 'читаю все' in t[0] and t[-1].count('/100') == nice.PER_PAGE, (calls, t)
+cb('b|01|num|2')
+assert texts()[-1].count('/100') == 60 - 2 * nice.PER_PAGE
+assert [len(k) for k in bot.nice_kb('01', 'num', 1, 3)] == [2] + [2] * 5 + [1] and len(bot.nice_kb('01', 'top', 0, 1)) == 6
+assert all(len(b['callback_data']) <= 64 for k in bot.nice_kb('01', 'num', 1, 3) for b in k)
+for bad in ('b|01|xxx|0', 'b|10|top|0', 'b|01|top|0|0', 'f|', 'b|'):
+    cb(bad)
+    assert not texts(), bad
+bot.NICE.clear()
+
+
+def broken(region):
+    raise RuntimeError('нет связи')
+
+
+srs.fetch_all_free = broken
+msg('/blat')
+assert 'не ответил' in texts()[-1] and not bot.NICE and not bot.NICE_LOCK.locked()
+
 # учёт входящих: кто, сколько раз, что спрашивал; /stats отвечает только владельцу
 ch = bot.S.d['chats'][str(CID)]
 n0, cb0 = ch['n'], ch['cb']
@@ -286,7 +349,7 @@ class FakePortal:
     UUIDS = ['%08d-0000-0000-0000-000000000000' % i for i in range(10)]
 
     def __init__(self):
-        self.data, self.sess, self.log = {}, {}, []
+        self.data, self.sess, self.log, self.hook = {}, {}, [], None
 
     def render(self, kind, rows, total):
         if kind == 'plates':
@@ -313,6 +376,8 @@ class FakePortal:
         if data.get('table_pagination'):
             st['first'] = int(data['table_first'])
             self.log.append('page')
+            if self.hook:
+                self.hook()
             return cookie, self.render(kind, self.data.get(st['key'], [])[st['first']:st['first'] + per], None)
         region = '%02d' % self.UUIDS.index(data[srs.REGION_FIELD[kind] + '_input'])
         st['key'] = (kind, region, data['j_idt53_input'].rsplit('@', 1)[-1], data['digits'], data['series'])
@@ -333,13 +398,14 @@ class FakeHttp:
         if method == 'HEAD':
             PORTAL.log.append('HEAD')
             return ''
-        sid, body = PORTAL.handle((jar or {}).get('JSESSIONID'), path, data)
+        with PORTAL_LOCK:
+            sid, body = PORTAL.handle((jar or {}).get('JSESSIONID'), path, data)
         if jar is not None:
             jar['JSESSIONID'] = sid
         return body
 
 
-PORTAL = FakePortal()
+PORTAL, PORTAL_LOCK = FakePortal(), threading.Lock()
 srs._Http, srs._throttle = FakeHttp, lambda: None
 for k in srs._pool:
     srs._pool[k].clear()
@@ -386,6 +452,57 @@ except RuntimeError as e:
 r, log = portal(REAL_FREE, '01', '777')
 assert sorted(r) == plates('777', 5) and log == 'set', (r, log)                    # сессия после этого жива
 assert len(srs._pool['plates']) == 1, srs._pool
+
+# весь список свободных: несколько сессий разом, ничего не теряется
+row_ = lambda i: '%03d%s%s%s' % (i % 999 + 1, chr(65 + i // 676 % 26), chr(65 + i // 26 % 26), chr(65 + i % 26))
+everything = [row_(i) for i in range(1030)]
+PORTAL.data.update({('plates', '03', 'notSold', '', ''): everything, ('plates', '04', 'notSold', '', ''): everything[:40]})
+r, log = portal(REAL_ALL, '03')
+assert sorted(r) == sorted(everything) and log.count('set') == 4 and len(srs._pool['plates']) <= srs.POOL_KEEP, (len(r), log)
+r, log = portal(REAL_ALL, '04')
+assert sorted(r) == sorted(everything[:40]) and log.count('page') <= 1, (len(r), log)
+assert portal(REAL_ALL, '05')[0] == {}
+
+
+def expire():                                        # сессии истекли посреди выкачки — открываем новые и продолжаем
+    if PORTAL.log.count('page') == 6:
+        PORTAL.hook = None
+        PORTAL.sess.clear()
+
+
+PORTAL.hook = expire
+r, log = portal(REAL_ALL, '03')
+assert sorted(r) == sorted(everything) and 'expired' in log, (len(r), log)
+
+
+def shrink():                                        # пока читали, номера раскупили: последней страницы больше нет
+    PORTAL.hook = None
+    PORTAL.data[('plates', '03', 'notSold', '', '')] = everything[:1020]
+
+
+PORTAL.hook = shrink
+r, log = portal(REAL_ALL, '03')
+assert set(everything[:1020]) <= set(r) <= set(everything), len(r)
+PORTAL.hook = lambda: PORTAL.data.update({('plates', '03', 'notSold', '', ''): everything[:64]})     # список рассыпался
+try:
+    REAL_ALL('03')
+    raise AssertionError('половина списка — это ошибка, а не подборка')
+except RuntimeError:
+    pass
+PORTAL.hook = None
+# именной номер без цифр портал отдаёт в том же списке (04 OMED) — пропускаем; чужая вёрстка — по-прежнему ошибка
+row = '<li class="ui-datalist-item"><a href="/plate.xhtml?symbols=%s">%s<b class="lp-letters">%s</b><b class="lp-pub-price">9</b></li>'
+num = '<b class="lp-numbers">777</b>'
+assert srs._plate_rows(row % ('777ABC', num, 'ABC') + row % ('nullOMED', '', 'OMED')) == {'777ABC': 9}
+try:
+    srs._plate_rows(row % ('777ABC', '', 'ABC'))
+    raise AssertionError('непонятную строку нельзя молча пропускать')
+except AttributeError:
+    pass
+r, log = portal(REAL_FREE, '01', '777')
+assert sorted(r) == plates('777', 5), (r, log)       # после всего этого маски работают как прежде
+srs._pool['plates'][1:] = []
+srs._pool['http'][1:] = []
 
 day = lambda n: (dt.datetime(2026, 11, 30) - dt.timedelta(days=n)).strftime('%d.%m.%Y 10:00')
 sym = lambda c, i: '070%s%s%s' % (c, chr(65 + i // 26), chr(65 + i % 26))
